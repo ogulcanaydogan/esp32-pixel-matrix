@@ -658,6 +658,9 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 <div class="btn" id="m8" onclick="sm(8)">Clock</div>
 <div class="btn" id="m9" onclick="sm(9)">Temp</div>
 </div>
+<div id="tempBox" style="display:none;text-align:center;padding:14px;background:#1a1a1a;border-radius:10px;margin-bottom:14px">
+<span style="font-size:2.2em;font-weight:700" id="tempVal">--</span><span style="font-size:1em;color:#888">&#176;C</span>
+</div>
 
 <h2>Pixel Art</h2>
 <div class="pixel-grid">
@@ -782,8 +785,28 @@ function sc(hex){cp.value='#'+hex;sa(0);send('/color?hex='+hex);showMode(0)}
 function sm(m){sa(m);send('/mode?m='+m);showMode(m)}
 function bmp(name){send('/bitmap?name='+name);showMode(5)}
 
+let tempTimer=null;
 function showMode(m){
   document.getElementById('st').textContent='Mode: '+(modeNames[m]||'Bitmap');
+  let tb=document.getElementById('tempBox');
+  if(m==9){
+    tb.style.display='block';
+    pollTemp();
+    if(tempTimer)clearInterval(tempTimer);
+    tempTimer=setInterval(pollTemp,2000);
+  }else{
+    tb.style.display='none';
+    if(tempTimer){clearInterval(tempTimer);tempTimer=null;}
+  }
+}
+function pollTemp(){
+  fetch('/cpu-temp').then(r=>r.json()).then(d=>{
+    let t=d.temp;
+    let el=document.getElementById('tempVal');
+    el.textContent=t.toFixed(1);
+    let clr=t<45?'#0064ff':t<60?'#00dc50':t<75?'#ffc800':'#ff0000';
+    el.style.color=clr;
+  }).catch(()=>{});
 }
 
 function sa(m){
