@@ -2,19 +2,23 @@
 
 Single-file ESP32 firmware for an 8x8 WS2812B LED matrix with a mobile-friendly web UI.
 
-Comes with built-in pixel art icons, image upload, scrolling text, visual effects, NTP clock, CPU temperature monitoring, and a notification API you can hook into your dev tools.
+Comes with built-in pixel art icons, image upload, scrolling text, visual effects, music visualizer, Pacman animation, NTP clock, CPU temperature monitoring, and a notification API you can hook into your dev tools.
 
 ![Web UI](docs/webui.png)
 
 ## Features
 
 - **Web UI** with color picker, presets, and live controls
-- **8 visual effects**: solid, rainbow, breathe, wave, matrix rain, Game of Life, NTP clock, CPU temp
+- **12 visual effects**: solid, rainbow, breathe, wave, matrix rain, Game of Life, NTP clock, CPU temp, music reactive, Pacman
+- **Music visualizer**: 3 styles (bars with peak hold, wave, rings) using microphone input
+- **Pacman animation**: classic Pacman moving across the matrix, eating dots, ghost chasing
 - **11 pixel art icons**: heart, smiley, star, ghost, music, skull, etc.
-- **Image upload**: drag & drop any image, auto-resized to 8x8 (binary RGB, fast)
+- **Image upload**: drag & drop any image, auto-resized to 8x8
 - **Scrolling text** with custom color and speed
-- **Notification API**: trigger alerts (input/done/error) with customizable colors and animation styles
-- **CPU temperature** display, color-coded (blue/green/yellow/red)
+- **Status dashboard**: fixed top bar showing WiFi SSID, signal strength, CPU temp, active mode
+- **Live LED preview**: floating widget showing real-time matrix state
+- **Multi-WiFi**: auto-connects to strongest available network
+- **Notification API**: trigger alerts (input/done/error) with customizable colors and animations
 - **mDNS**: access via `http://esp32matrix.local`
 - **CORS enabled** for easy API integration
 - **Rotation**: 0/90/180/270 degrees + horizontal/vertical flip
@@ -48,7 +52,16 @@ cd esp32-pixel-matrix
 cp credentials.example.h credentials.h
 ```
 
-Edit `credentials.h` with your WiFi SSID and password.
+Edit `credentials.h` with your WiFi credentials. You can add multiple networks:
+
+```cpp
+const char* WIFI_SSID = "HomeWiFi";
+const char* WIFI_PASS = "password1";
+const char* WIFI_SSID2 = "WorkWiFi";
+const char* WIFI_PASS2 = "password2";
+```
+
+The ESP32 will automatically connect to whichever network is available.
 
 ### 2. Upload (Arduino IDE)
 
@@ -77,7 +90,7 @@ Base URL: `http://esp32matrix.local`
 |----------|--------|--------|--------------|
 | `/` | GET | | Web UI |
 | `/color` | GET | `hex` (e.g. `ff0000`) | Set solid color |
-| `/mode` | GET | `m` (0-9) | Switch mode |
+| `/mode` | GET | `m` (0-11) | Switch mode |
 | `/brightness` | GET | `v` (1-30) | Set brightness |
 | `/speed` | GET | `v` (10-500) | Animation speed in ms |
 | `/toggle` | GET | | Toggle on/off |
@@ -89,22 +102,26 @@ Base URL: `http://esp32matrix.local`
 | `/alert-config` | GET | `type`, `color`, `style` | Save alert defaults |
 | `/alerts` | GET | `v` (0 or 1) | Enable/disable alerts |
 | `/cpu-temp` | GET | | Get CPU temp as JSON |
-| `/status` | GET | | Current state as JSON |
+| `/status` | GET | | Current state as JSON (mode, WiFi, temp, RSSI) |
+| `/music-frame` | POST | 192 bytes base64 RGB | Send music visualization frame |
+| `/led-state` | GET | | Current LED colors as JSON array |
 
 ### Modes
 
-| ID | Name |
-|----|------|
-| 0 | Solid |
-| 1 | Rainbow |
-| 2 | Breathe |
-| 3 | Wave |
-| 4 | Matrix Rain |
-| 5 | Bitmap |
-| 6 | Scrolling Text |
-| 7 | Game of Life |
-| 8 | NTP Clock |
-| 9 | CPU Temp |
+| ID | Name | Description |
+|----|------|-------------|
+| 0 | Solid | Single color |
+| 1 | Rainbow | Rotating rainbow cycle |
+| 2 | Breathe | Pulsing solid color |
+| 3 | Wave | Diagonal wave pattern |
+| 4 | Matrix Rain | Green rain drops |
+| 5 | Bitmap | Pixel art display |
+| 6 | Scrolling Text | Horizontal scroll |
+| 7 | Game of Life | Conway's simulation |
+| 8 | NTP Clock | Real-time clock display |
+| 9 | CPU Temp | Temperature readout |
+| 10 | Music | Microphone-reactive visualizer |
+| 11 | Pacman | Pacman animation |
 
 ### Built-in Icons
 
@@ -119,6 +136,17 @@ import requests
 img = Image.open("myimage.png").resize((8, 8)).convert("RGB")
 requests.post("http://esp32matrix.local/upload-bitmap", data=img.tobytes())
 ```
+
+## Music Visualizer
+
+The Music mode uses the browser's microphone to analyze audio and send visualization frames to the matrix in real-time.
+
+**3 visualization styles:**
+- **Bars**: frequency spectrum with peak hold indicators
+- **Wave**: per-band energy waveform
+- **Rings**: expanding rings reacting to bass
+
+Note: Microphone access requires HTTPS or a localhost exception in Chrome.
 
 ## Notification API
 
@@ -182,7 +210,7 @@ python controller.py
 
 ```
 esp32-pixel-matrix/
-├── esp32-matrix-test.ino    # main firmware
+├── esp32-matrix-test.ino    # main firmware (single file, ~1400 lines)
 ├── bitmaps.h                # 11 pixel art icons
 ├── fonts.h                  # 5x7 bitmap font
 ├── credentials.h            # your wifi creds (gitignored)

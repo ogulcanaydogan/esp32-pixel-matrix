@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Adafruit_NeoPixel.h>
@@ -14,10 +15,11 @@
 #define MATRIX_H   8
 
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_RGB + NEO_KHZ800);
+WiFiMulti wifiMulti;
 WebServer server(80);
 
 // --- State ---
-uint8_t mode = 1;          // 0=solid,1=rainbow,2=breathe,3=wave,4=matrixRain,5=bitmap,6=text,7=gameOfLife,8=clock
+uint8_t mode = 1;          // 0=solid,1=rainbow,2=breathe,3=wave,4=matrixRain,5=bitmap,6=text,7=gameOfLife,8=clock,9=cpuTemp,10=music,11=pacman
 uint8_t solidR = 255, solidG = 0, solidB = 100;
 bool ledsOn = true;
 uint16_t animSpeed = 50;   // ms delay for animations (10-500)
@@ -72,6 +74,37 @@ time_t currentTime = 0;
 // CPU Temperature
 unsigned long lastTempRead = 0;
 float cpuTemp = 0;
+
+// Music Reactive
+uint32_t musicFrame[64];
+unsigned long lastMusicFrame = 0;
+
+// Pacman effect (mode 11)
+int8_t pacX = -4;           // pacman X position (left edge of sprite)
+uint8_t pacMouth = 0;       // 0=closed, 1=half, 2=open, 3=half (cycles)
+bool ghostColorAlt = false;
+bool ghostWave = false;
+bool pacDots[8];            // dots at columns 0-7
+unsigned long lastPacFrame = 0;
+
+// --- Base64 decode ---
+int b64decode(const char* in, int inLen, uint8_t* out, int outMax) {
+  static const int8_t lut[128] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+  };
+  int j = 0;
+  for (int i = 0; i + 3 < inLen && j < outMax; i += 4) {
+    uint32_t n = ((uint32_t)lut[(uint8_t)in[i]] << 18) | ((uint32_t)lut[(uint8_t)in[i+1]] << 12) |
+                 ((uint32_t)lut[(uint8_t)in[i+2]] << 6) | (uint32_t)lut[(uint8_t)in[i+3]];
+    if (j < outMax) out[j++] = (n >> 16) & 0xFF;
+    if (j < outMax && in[i+2] != '=') out[j++] = (n >> 8) & 0xFF;
+    if (j < outMax && in[i+3] != '=') out[j++] = n & 0xFF;
+  }
+  return j;
+}
 
 // --- Helpers ---
 int xyToIndex(int x, int y) {
@@ -372,6 +405,23 @@ void modeClock() {
   modeScrollText();
 }
 
+void modeMusicReactive() {
+  // Show musicFrame contents, fade out if no data for 500ms
+  unsigned long elapsed = millis() - lastMusicFrame;
+  float fade = 1.0;
+  if (elapsed > 500) fade = max(0.0, 1.0 - (elapsed - 500) / 1000.0);
+
+  for (int i = 0; i < 64; i++) {
+    uint32_t c = musicFrame[i];
+    uint8_t r = ((c >> 16) & 0xFF) * fade;
+    uint8_t g = ((c >> 8) & 0xFF) * fade;
+    uint8_t b = (c & 0xFF) * fade;
+    int ri = rotIndex(i);
+    if (ri >= 0) strip.setPixelColor(ri, strip.Color(r, g, b));
+  }
+  strip.show();
+}
+
 void modeCpuTemp() {
   if (millis() - lastTempRead > 2000 || lastTempRead == 0) {
     lastTempRead = millis();
@@ -390,6 +440,113 @@ void modeCpuTemp() {
     else { textR = 255; textG = 0; textB = 0; }                        // red (hot)
   }
   modeScrollText();
+}
+
+void modePacman() {
+  unsigned long now = millis();
+  if (now - lastPacFrame < animSpeed * 3) return;
+  lastPacFrame = now;
+
+  strip.clear();
+
+  // Advance state
+  pacX++;
+  pacMouth = (pacMouth + 1) % 4;
+  ghostWave = !ghostWave;
+
+  // Mouth: 0→closed, 1→half, 2→open, 3→half (map 3→1)
+  uint8_t mf = pacMouth;
+  if (mf == 3) mf = 1;
+
+  int8_t gx = pacX - 6; // ghost 6 pixels behind
+
+  // Wrap around
+  if (pacX > MATRIX_W + 4) {
+    pacX = -4;
+    gx = pacX - 6;
+    for (int i = 0; i < 8; i++) pacDots[i] = false;
+    ghostColorAlt = !ghostColorAlt;
+  }
+
+  // Eat dots — pacman eats when its left edge reaches dot column
+  for (int i = 0; i < 8; i++) {
+    if (!pacDots[i] && pacX >= i) pacDots[i] = true;
+  }
+
+  // --- Draw dots (row 4, every column that isn't eaten) ---
+  for (int i = 0; i < 8; i++) {
+    if (!pacDots[i]) setPixelXY(i, 4, 255, 185, 80);
+  }
+
+  // --- Draw maze border hints (top & bottom rows, dark blue) ---
+  for (int x = 0; x < 8; x++) {
+    setPixelXY(x, 0, 0, 0, 30);
+    setPixelXY(x, 7, 0, 0, 30);
+  }
+
+  // --- Draw Pacman (4x4 sprite, rows 2-5) ---
+  // Closed:  .YY.  Half:   .YY.  Open:   .YY.
+  //          YYYY          YYY.          YY..
+  //          YYYY          YYY.          YY..
+  //          .YY.          .YY.          .YY.
+  for (int dy = 0; dy < 4; dy++) {
+    for (int dx = 0; dx < 4; dx++) {
+      int sx = pacX + dx;
+      int sy = 2 + dy;
+      if (sx < 0 || sx >= MATRIX_W) continue;
+
+      // Circle: corners empty
+      if ((dy == 0 || dy == 3) && (dx == 0 || dx == 3)) continue;
+
+      // Mouth cutout (right side columns)
+      if (mf == 2) { // wide open: remove cols 2-3 on middle rows
+        if (dx >= 2 && (dy == 1 || dy == 2)) continue;
+      } else if (mf == 1) { // half: remove col 3 on middle rows
+        if (dx == 3 && (dy == 1 || dy == 2)) continue;
+      }
+      // mf==0: closed, no cutout
+
+      setPixelXY(sx, sy, 255, 255, 0);
+    }
+  }
+  // Eye at top-left of body (offset 1,0 from pacX)
+  if (pacX + 1 >= 0 && pacX + 1 < MATRIX_W) setPixelXY(pacX + 1, 2, 0, 0, 0);
+
+  // --- Draw Ghost (4x4 sprite, rows 2-5) ---
+  // Shape:  .GG.
+  //         GGGG
+  //         GWGW  (W=white eyes at dx 1,3)
+  //         G.G.  or .G.G (wavy alternates)
+  uint8_t gR, gG, gB;
+  if (ghostColorAlt) { gR = 0; gG = 200; gB = 200; }
+  else { gR = 255; gG = 0; gB = 0; }
+
+  for (int dy = 0; dy < 4; dy++) {
+    for (int dx = 0; dx < 4; dx++) {
+      int sx = gx + dx;
+      int sy = 2 + dy;
+      if (sx < 0 || sx >= MATRIX_W) continue;
+
+      // Top corners empty
+      if (dy == 0 && (dx == 0 || dx == 3)) continue;
+
+      // Wavy bottom
+      if (dy == 3) {
+        if (ghostWave && (dx == 1 || dx == 3)) continue;
+        if (!ghostWave && (dx == 0 || dx == 2)) continue;
+      }
+
+      // Eyes on row 2 (dy==2), columns 1 and 3
+      if (dy == 2 && (dx == 1 || dx == 3)) {
+        setPixelXY(sx, sy, 255, 255, 255);
+        continue;
+      }
+
+      setPixelXY(sx, sy, gR, gG, gB);
+    }
+  }
+
+  strip.show();
 }
 
 // --- Web Handlers ---
@@ -417,6 +574,14 @@ void handleMode() {
   if (mode == 7) { // init game of life
     for (int i = 0; i < 64; i++) golGrid[i] = random(0, 2);
     golGen = 0; golStaleCount = 0;
+  }
+  if (mode == 11) { // init pacman
+    pacX = -4;
+    pacMouth = 0;
+    ghostColorAlt = false;
+    ghostWave = false;
+    for (int i = 0; i < 8; i++) pacDots[i] = false;
+    lastPacFrame = 0;
   }
   server.send(200, "text/plain", "ok");
 }
@@ -510,12 +675,11 @@ void handleBitmap() {
 
 void handleUploadBitmap() {
   String body = server.arg("plain");
-  if ((int)body.length() >= 192) {
+  uint8_t buf[192];
+  int decoded = b64decode(body.c_str(), body.length(), buf, 192);
+  if (decoded >= 192) {
     for (int i = 0; i < 64; i++) {
-      uint8_t r = (uint8_t)body[i * 3];
-      uint8_t g = (uint8_t)body[i * 3 + 1];
-      uint8_t b = (uint8_t)body[i * 3 + 2];
-      customBitmap[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+      customBitmap[i] = ((uint32_t)buf[i*3] << 16) | ((uint32_t)buf[i*3+1] << 8) | buf[i*3+2];
     }
     hasCustomBitmap = true;
     bitmapSource = 3;
@@ -523,7 +687,7 @@ void handleUploadBitmap() {
     ledsOn = true;
     server.send(200, "text/plain", "ok");
   } else {
-    server.send(400, "text/plain", "need 192 bytes (64 RGB)");
+    server.send(400, "text/plain", "need 192 bytes b64");
   }
 }
 
@@ -565,20 +729,50 @@ void handleSpeed() {
 }
 
 void handleStatus() {
-  const char* modeNames[] = {"Solid","Rainbow","Breathe","Wave","Matrix Rain","Bitmap","Text","Game of Life","Clock","CPU Temp"};
-  String modeName = (mode <= 9) ? modeNames[mode] : "Unknown";
+  const char* modeNames[] = {"Solid","Rainbow","Breathe","Wave","Matrix Rain","Bitmap","Text","Game of Life","Clock","CPU Temp","Music","Pacman"};
+  String modeName = (mode <= 11) ? modeNames[mode] : "Unknown";
   String json = "{\"mode\":" + String(mode) + ",\"modeName\":\"" + modeName + "\",\"on\":" + String(ledsOn ? "true" : "false") +
     ",\"alerts\":" + String(alertsEnabled ? "true" : "false") +
     ",\"rotation\":" + String(rotation) +
     ",\"speed\":" + String(animSpeed) +
-    ",\"cpuTemp\":" + String(cpuTemp, 1) + "}";
+    ",\"cpuTemp\":" + String(temperatureRead(), 1) +
+    ",\"wifi\":\"" + WiFi.SSID() + "\"" +
+    ",\"ip\":\"" + WiFi.localIP().toString() + "\"" +
+    ",\"rssi\":" + String(WiFi.RSSI()) + "}";
   server.send(200, "application/json", json);
+}
+
+void handleMusicFrame() {
+  String body = server.arg("plain");
+  uint8_t buf[192];
+  int decoded = b64decode(body.c_str(), body.length(), buf, 192);
+  if (decoded >= 192) {
+    for (int i = 0; i < 64; i++) {
+      musicFrame[i] = ((uint32_t)buf[i*3] << 16) | ((uint32_t)buf[i*3+1] << 8) | buf[i*3+2];
+    }
+    lastMusicFrame = millis();
+    if (mode != 10) { mode = 10; ledsOn = true; }
+    server.send(200, "text/plain", "ok");
+  } else {
+    server.send(400, "text/plain", "need 192 bytes b64");
+  }
 }
 
 void handleCpuTemp() {
   cpuTemp = temperatureRead();
   String json = "{\"temp\":" + String(cpuTemp, 1) + "}";
   server.send(200, "application/json", json);
+}
+
+void handleLedState() {
+  String out = "[";
+  for (int i = 0; i < 64; i++) {
+    uint32_t c = strip.getPixelColor(i);
+    if (i > 0) out += ",";
+    out += String(c);
+  }
+  out += "]";
+  server.send(200, "application/json", out);
 }
 
 // --- HTML UI ---
@@ -626,12 +820,21 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 .upload-badge{display:none;text-align:center;color:#0f0;font-size:.8em;margin-top:4px}
 .pixel-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
 .speed-labels{display:flex;justify-content:space-between;font-size:.7em;color:#555;margin-bottom:2px}
+.dash{position:fixed;top:0;left:0;right:0;z-index:999;background:#111e;backdrop-filter:blur(10px);border-bottom:1px solid #222;padding:6px 16px;display:flex;justify-content:center;gap:16px;font-size:.72em;color:#888}
+.dash span{display:flex;align-items:center;gap:4px}
+.dash .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
 .rot-btns{display:flex;gap:4px;flex-wrap:wrap}
 .rot-btns .btn{padding:6px 8px;font-size:.75em}
 </style>
 </head>
 <body>
-<div class="c">
+<div class="dash">
+<span><i class="dot" id="dWifi" style="background:#0a0"></i> <span id="dSsid">--</span></span>
+<span id="dTemp">--</span>
+<span id="dRssi">--</span>
+<span id="dMode">--</span>
+</div>
+<div class="c" style="padding-top:30px">
 <h1>LED Matrix</h1>
 
 <input type="color" id="cp" class="color-pick" value="#ff0064">
@@ -657,9 +860,20 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 <div class="btn" id="m7" onclick="sm(7)">Life</div>
 <div class="btn" id="m8" onclick="sm(8)">Clock</div>
 <div class="btn" id="m9" onclick="sm(9)">Temp</div>
+<div class="btn" id="m10" onclick="startMusic()">Music</div>
+<div class="btn" id="m11" onclick="sm(11)">Pacman</div>
 </div>
 <div id="tempBox" style="display:none;text-align:center;padding:14px;background:#1a1a1a;border-radius:10px;margin-bottom:14px">
 <span style="font-size:2.2em;font-weight:700" id="tempVal">--</span><span style="font-size:1em;color:#888">&#176;C</span>
+</div>
+<div id="musicBox" style="display:none;text-align:center;padding:14px;background:#1a1a1a;border-radius:10px;margin-bottom:14px">
+<canvas id="musicVis" width="160" height="160" style="border-radius:6px;background:#000"></canvas>
+<div id="musicStyles" style="display:flex;gap:4px;margin-top:8px;justify-content:center">
+<div class="btn active" id="vs0" onclick="setVis(0)" style="padding:6px 10px;font-size:.7em">Bars</div>
+<div class="btn" id="vs1" onclick="setVis(1)" style="padding:6px 10px;font-size:.7em">Wave</div>
+<div class="btn" id="vs2" onclick="setVis(2)" style="padding:6px 10px;font-size:.7em">Rings</div>
+</div>
+<div style="color:#888;font-size:.75em;margin-top:6px" id="musicStatus">Tap Music to start</div>
 </div>
 
 <h2>Pixel Art</h2>
@@ -668,7 +882,6 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 <div class="btn" onclick="bmp('heart')">Heart</div>
 <div class="btn" onclick="bmp('smiley')">Smiley</div>
 <div class="btn" onclick="bmp('star')">Star</div>
-<div class="btn" onclick="bmp('music')">Music</div>
 <div class="btn" onclick="bmp('ghost')">Ghost</div>
 <div class="btn" onclick="bmp('sun')">Sun</div>
 <div class="btn" onclick="bmp('moon')">Moon</div>
@@ -771,13 +984,41 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 </div>
 
 <button class="off-btn" id="toggle" onclick="toggleLeds()">Turn Off</button>
+
+<div id="liveBox" style="position:fixed;bottom:16px;right:16px;z-index:1000">
+<div id="liveWidget" style="display:none;background:#1a1a1a;border:2px solid #333;border-radius:12px;padding:8px;margin-bottom:8px;box-shadow:0 4px 20px rgba(0,0,0,.6)">
+<canvas id="ledPreview" width="120" height="120" style="border-radius:6px;background:#000;display:block"></canvas>
+</div>
+<div style="text-align:right"><button id="prevBtn" onclick="togglePreview()" style="width:44px;height:44px;border-radius:50%;border:2px solid #333;background:#222;color:#0af;font-size:1.1em;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.4)">&#x25A3;</button></div>
+</div>
 <div class="status" id="st">Mode: Rainbow</div>
 </div>
 <script>
 let isOn=true;
 const cp=document.getElementById('cp');
-const modeIds=[0,1,2,3,4,7,8,9];
-const modeNames={0:'Solid',1:'Rainbow',2:'Breathe',3:'Wave',4:'Matrix Rain',5:'Bitmap',6:'Text',7:'Game of Life',8:'Clock',9:'CPU Temp'};
+
+// Dashboard polling
+function pollDash(){
+  fetch('/status').then(r=>r.json()).then(d=>{
+    let w=document.getElementById('dWifi');
+    let connected=d.wifi&&d.wifi.length>0;
+    w.style.background=connected?'#0a0':'#a00';
+    document.getElementById('dSsid').textContent=connected?d.wifi:'No WiFi';
+    let t=d.cpuTemp||0;
+    let tc=t<45?'#0af':t<60?'#0d4':t<75?'#fa0':'#f00';
+    document.getElementById('dTemp').innerHTML='<span style="color:'+tc+'">'+t.toFixed(0)+'&deg;C</span>';
+    let rssi=d.rssi||0;
+    let bars=rssi>-50?4:rssi>-60?3:rssi>-70?2:1;
+    document.getElementById('dRssi').textContent='Signal: '+'\u2582\u2584\u2586\u2588'.slice(0,bars);
+    document.getElementById('dMode').textContent=d.on?d.modeName:'OFF';
+  }).catch(()=>{
+    document.getElementById('dWifi').style.background='#a00';
+    document.getElementById('dSsid').textContent='Offline';
+  });
+}
+pollDash();setInterval(pollDash,3000);
+const modeIds=[0,1,2,3,4,7,8,9,10,11];
+const modeNames={0:'Solid',1:'Rainbow',2:'Breathe',3:'Wave',4:'Matrix Rain',5:'Bitmap',6:'Text',7:'Game of Life',8:'Clock',9:'CPU Temp',10:'Music',11:'Pacman'};
 
 cp.addEventListener('input',function(){sc(this.value.substring(1))});
 
@@ -789,6 +1030,7 @@ let tempTimer=null;
 function showMode(m){
   document.getElementById('st').textContent='Mode: '+(modeNames[m]||'Bitmap');
   let tb=document.getElementById('tempBox');
+  let mb=document.getElementById('musicBox');
   if(m==9){
     tb.style.display='block';
     pollTemp();
@@ -797,6 +1039,12 @@ function showMode(m){
   }else{
     tb.style.display='none';
     if(tempTimer){clearInterval(tempTimer);tempTimer=null;}
+  }
+  if(m==10){
+    mb.style.display='block';
+  }else{
+    mb.style.display='none';
+    stopMusic();
   }
 }
 function pollTemp(){
@@ -846,6 +1094,168 @@ function send(path){
   });
 }
 
+// Music reactive
+let musicRunning=false,musicStream=null,musicCtx=null,musicRaf=null;
+let visStyle=0;
+let waveHist=new Array(8).fill(4);
+let ringHue=0;
+let barPeaks=new Array(8).fill(0);
+let barPeakHold=new Array(8).fill(0);
+const binR=[[1,2],[3,5],[6,9],[10,16],[17,26],[27,40],[41,60],[61,90]];
+
+function setVis(s){visStyle=s;for(let i=0;i<3;i++){let e=document.getElementById('vs'+i);if(e)e.classList.toggle('active',i==s)}}
+function sPx(b,x,y,r,g,bl){if(x<0||x>7||y<0||y>7)return;let i=(y*8+x)*3;b[i]=r;b[i+1]=g;b[i+2]=bl}
+function b2s(bytes){let s='';for(let i=0;i<bytes.length;i++)s+=String.fromCharCode(bytes[i]);return btoa(s)}
+
+function renderBars(fd,bytes){
+  for(let x=0;x<8;x++){
+    let sum=0,cnt=0;
+    for(let b=binR[x][0];b<=binR[x][1]&&b<fd.length;b++){sum+=fd[b];cnt++}
+    let val=cnt?sum/cnt:0;
+    let barH=Math.min(8,Math.floor(val/28));
+    // Peak hold
+    if(barH>=barPeaks[x]){barPeaks[x]=barH;barPeakHold[x]=12}
+    else{barPeakHold[x]--;if(barPeakHold[x]<=0)barPeaks[x]=Math.max(0,barPeaks[x]-1)}
+    for(let y=0;y<8;y++){
+      if(y<barH){
+        let ratio=y/7.0;
+        let r=Math.floor(255*ratio),g=Math.floor(255*(1-ratio)),bl=y<2?Math.floor(60*(1-y/2)):0;
+        sPx(bytes,x,7-y,r,g,bl);
+      }
+    }
+    // Draw peak marker
+    let pk=barPeaks[x];
+    if(pk>0&&pk>barH)sPx(bytes,x,7-pk,255,255,255);
+  }
+}
+
+function renderWave(fd,bytes){
+  // Per-column band energy for real waveform shape
+  for(let x=0;x<8;x++){
+    let sum=0,cnt=0;
+    for(let b=binR[x][0];b<=binR[x][1]&&b<fd.length;b++){sum+=fd[b];cnt++}
+    let val=cnt?sum/cnt:0;
+    let wy=Math.min(7,Math.floor(val/36));
+    waveHist[x]=waveHist[x]*0.5+wy*0.5; // smooth
+    let sy=Math.round(waveHist[x]);
+    for(let row=0;row<8;row++){
+      let ry=7-row;
+      if(row<=sy){
+        let ratio=row/7;
+        let bright=row==sy?1.0:0.3+0.4*(row/sy);
+        let r=Math.floor((50+205*ratio)*bright);
+        let g=Math.floor((200*(1-ratio))*bright);
+        let bl=Math.floor((255*(1-ratio))*bright);
+        sPx(bytes,x,ry,r,g,bl);
+      }
+    }
+  }
+}
+
+function hsl2rgb(h,s,l){
+  h/=360;let r,g,b;
+  if(s==0){r=g=b=l}else{
+    let hue2rgb=function(p,q,t){if(t<0)t+=1;if(t>1)t-=1;if(t<1/6)return p+(q-p)*6*t;if(t<1/2)return q;if(t<2/3)return p+(q-p)*(2/3-t)*6;return p};
+    let q=l<0.5?l*(1+s):l+s-l*s,p=2*l-q;
+    r=hue2rgb(p,q,h+1/3);g=hue2rgb(p,q,h);b=hue2rgb(p,q,h-1/3);
+  }
+  return[Math.round(r*255),Math.round(g*255),Math.round(b*255)];
+}
+
+function renderRings(fd,bytes){
+  let bass=0;for(let i=1;i<=5&&i<fd.length;i++)bass+=fd[i];bass/=5;
+  let radius=(bass/255)*4.5;
+  ringHue=(ringHue+3)%360;
+  let cx=3.5,cy=3.5;
+  for(let y=0;y<8;y++){
+    for(let x=0;x<8;x++){
+      let dist=Math.sqrt((x-cx)*(x-cx)+(y-cy)*(y-cy));
+      let rd=Math.abs(dist-radius);
+      if(rd<1.4){
+        let bright=1.0-(rd/1.4);
+        let c=hsl2rgb(ringHue,1,bright*0.5);
+        sPx(bytes,x,y,c[0],c[1],c[2]);
+      }
+    }
+  }
+  // inner glow
+  let c2=hsl2rgb((ringHue+180)%360,1,bass/600);
+  sPx(bytes,3,3,c2[0],c2[1],c2[2]);sPx(bytes,4,3,c2[0],c2[1],c2[2]);
+  sPx(bytes,3,4,c2[0],c2[1],c2[2]);sPx(bytes,4,4,c2[0],c2[1],c2[2]);
+}
+
+function drawPreview(bytes,vCtx){
+  vCtx.fillStyle='#000';vCtx.fillRect(0,0,160,160);
+  for(let y=0;y<8;y++){
+    for(let x=0;x<8;x++){
+      let i=(y*8+x)*3;
+      let r=bytes[i],g=bytes[i+1],b=bytes[i+2];
+      if(r||g||b){vCtx.fillStyle='rgb('+r+','+g+','+b+')'}else{vCtx.fillStyle='#111'}
+      vCtx.fillRect(x*20,y*20,18,18);
+    }
+  }
+}
+
+function initMusicAnalyser(stream){
+  musicStream=stream;
+  musicCtx=new (window.AudioContext||window.webkitAudioContext)();
+  let src=musicCtx.createMediaStreamSource(stream);
+  let analyser=musicCtx.createAnalyser();
+  analyser.fftSize=256;
+  analyser.smoothingTimeConstant=0.7;
+  src.connect(analyser);
+  let freqData=new Uint8Array(analyser.frequencyBinCount);
+  musicRunning=true;
+  document.getElementById('musicStatus').textContent='Listening...';
+  let vCtx=document.getElementById('musicVis').getContext('2d');
+  let lastSend=0;
+  function render(){
+    if(!musicRunning)return;
+    analyser.getByteFrequencyData(freqData);
+    let bytes=new Uint8Array(192);
+    switch(visStyle){
+      case 0:renderBars(freqData,bytes);break;
+      case 1:renderWave(freqData,bytes);break;
+      case 2:renderRings(freqData,bytes);break;
+    }
+    drawPreview(bytes,vCtx);
+    let now=Date.now();
+    if(now-lastSend>50){
+      lastSend=now;
+      fetch('/music-frame',{method:'POST',headers:{'Content-Type':'text/plain'},body:b2s(bytes)}).catch(function(){});
+    }
+    musicRaf=requestAnimationFrame(render);
+  }
+  render();
+  send('/mode?m=10');
+}
+function startMusic(){
+  sa(10);showMode(10);
+  if(musicRunning)return;
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+      document.getElementById('musicStatus').innerHTML='Mic needs HTTPS. Open:<br><b>chrome://flags/#unsafely-treat-insecure-origin-as-secure</b><br>Add: <b>http://'+location.host+'</b> and relaunch Chrome';
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}).then(function(stream){
+      initMusicAnalyser(stream);
+    }).catch(function(e){
+      document.getElementById('musicStatus').textContent='Mic error: '+e.message;
+    });
+  }catch(e){
+    document.getElementById('musicStatus').textContent='Error: '+e.message;
+  }
+}
+function stopMusic(){
+  musicRunning=false;
+  if(musicRaf)cancelAnimationFrame(musicRaf);
+  if(musicStream)musicStream.getTracks().forEach(function(t){t.stop()});
+  if(musicCtx)musicCtx.close().catch(function(){});
+  musicStream=null;musicCtx=null;musicRaf=null;
+  let ms=document.getElementById('musicStatus');
+  if(ms)ms.textContent='Tap Music to start';
+}
+
 // Image upload with drag & drop
 const upArea=document.getElementById('upArea');
 upArea.addEventListener('dragover',function(e){e.preventDefault();this.classList.add('drag')});
@@ -881,8 +1291,8 @@ function processFile(file){
       grid.appendChild(d);
     }
     fetch('/upload-bitmap',{method:'POST',
-      headers:{'Content-Type':'application/octet-stream'},
-      body:bytes
+      headers:{'Content-Type':'text/plain'},
+      body:b2s(bytes)
     }).then(()=>{
       document.getElementById('uploadBadge').style.display='block';
       showMode(5);
@@ -891,6 +1301,32 @@ function processFile(file){
     });
   };
   img.src=URL.createObjectURL(file);
+}
+
+// Live LED preview
+let prevTimer=null,prevOn=false;
+function togglePreview(){
+  prevOn=!prevOn;
+  let w=document.getElementById('liveWidget');
+  let b=document.getElementById('prevBtn');
+  w.style.display=prevOn?'block':'none';
+  b.style.borderColor=prevOn?'#0af':'#333';
+  if(prevOn){pollLeds();prevTimer=setInterval(pollLeds,200)}
+  else{if(prevTimer){clearInterval(prevTimer);prevTimer=null}}
+}
+function pollLeds(){
+  fetch('/led-state').then(r=>r.json()).then(px=>{
+    let cv=document.getElementById('ledPreview');
+    let ctx=cv.getContext('2d');
+    ctx.fillStyle='#000';ctx.fillRect(0,0,120,120);
+    for(let i=0;i<64&&i<px.length;i++){
+      let c=px[i];
+      let r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
+      let x=i%8,y=Math.floor(i/8);
+      ctx.fillStyle=r||g||b?'rgb('+r+','+g+','+b+')':'#111';
+      ctx.fillRect(x*15,y*15,13,13);
+    }
+  }).catch(()=>{});
 }
 </script>
 </body>
@@ -910,10 +1346,11 @@ void setup() {
     strip.setPixelColor(i, strip.Color(5, 0, 0));
   strip.show();
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASS);
+  wifiMulti.addAP(WIFI_SSID2, WIFI_PASS2);
   Serial.print("Connecting");
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+  while (wifiMulti.run() != WL_CONNECTED && attempts < 40) {
     delay(500);
     Serial.print(".");
     attempts++;
@@ -960,6 +1397,8 @@ void setup() {
   server.on("/speed", handleSpeed);
   server.on("/status", handleStatus);
   server.on("/cpu-temp", handleCpuTemp);
+  server.on("/music-frame", HTTP_POST, handleMusicFrame);
+  server.on("/led-state", handleLedState);
   server.begin();
 
   // Init matrix rain speeds
@@ -1002,5 +1441,7 @@ void loop() {
     case 7: modeGameOfLife(); break;
     case 8: modeClock(); break;
     case 9: modeCpuTemp(); break;
+    case 10: modeMusicReactive(); break;
+    case 11: modePacman(); break;
   }
 }
