@@ -27,6 +27,13 @@ bool notifyActive = false;
 uint8_t notifyType = 0;       // 0=input,1=done,2=error
 unsigned long notifyStart = 0;
 bool alertsEnabled = true;
+uint16_t notifyDuration = 5000;
+
+// Per-alert-type config: [input, done, error]
+uint8_t alertR[3] = {255, 0, 255};
+uint8_t alertG[3] = {140, 200, 0};
+uint8_t alertB[3] = {0, 0, 0};
+uint8_t alertStyle[3] = {0, 1, 2};  // 0=breathe, 1=sweep, 2=blink, 3=pulse
 
 // Bitmap state
 uint32_t customBitmap[64];
@@ -62,6 +69,10 @@ unsigned long ntpLastSync = 0;
 long utcOffset = 3 * 3600; // UTC+3 Turkey
 time_t currentTime = 0;
 
+// CPU Temperature
+unsigned long lastTempRead = 0;
+float cpuTemp = 0;
+
 // --- Helpers ---
 int xyToIndex(int x, int y) {
   if (x < 0 || x >= MATRIX_W || y < 0 || y >= MATRIX_H) return -1;
@@ -89,36 +100,56 @@ void setPixelXY(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // --- Notification animations ---
-void notifyInputAnim() {
+void animBreathe(uint8_t r, uint8_t g, uint8_t b) {
   unsigned long elapsed = millis() - notifyStart;
   float phase = elapsed * 0.005;
   float breath = (sin(phase) + 1.0) / 2.0;
-  uint8_t r = 255 * breath, g = 140 * breath, b = 0;
   for (int i = 0; i < NUM_LEDS; i++)
-    strip.setPixelColor(i, strip.Color(r, g, b));
+    strip.setPixelColor(i, strip.Color(r * breath, g * breath, b * breath));
   strip.show();
 }
 
-void notifyDoneAnim() {
+void animSweep(uint8_t r, uint8_t g, uint8_t b) {
   unsigned long elapsed = millis() - notifyStart;
   int sweepPos = (elapsed / 60) % (MATRIX_W + 4);
   for (int y = 0; y < MATRIX_H; y++) {
     for (int x = 0; x < MATRIX_W; x++) {
       int dist = abs(x - sweepPos);
-      uint8_t g = dist < 3 ? (255 - dist * 80) : 0;
-      setPixelXY(x, y, 0, g, 0);
+      float bright = dist < 3 ? (1.0 - dist * 0.33) : 0;
+      setPixelXY(x, y, r * bright, g * bright, b * bright);
     }
   }
   strip.show();
 }
 
-void notifyErrorAnim() {
+void animBlink(uint8_t r, uint8_t g, uint8_t b) {
   unsigned long elapsed = millis() - notifyStart;
   bool on = (elapsed / 200) % 2 == 0;
-  uint32_t c = on ? strip.Color(255, 0, 0) : 0;
+  uint32_t c = on ? strip.Color(r, g, b) : 0;
   for (int i = 0; i < NUM_LEDS; i++)
     strip.setPixelColor(i, c);
   strip.show();
+}
+
+void animPulse(uint8_t r, uint8_t g, uint8_t b) {
+  unsigned long elapsed = millis() - notifyStart;
+  float phase = (elapsed % 600) / 600.0;
+  float bright = phase < 0.15 ? (phase / 0.15) : (1.0 - (phase - 0.15) / 0.85);
+  bright = bright * bright; // ease-out curve
+  for (int i = 0; i < NUM_LEDS; i++)
+    strip.setPixelColor(i, strip.Color(r * bright, g * bright, b * bright));
+  strip.show();
+}
+
+void runNotifyAnim() {
+  uint8_t r = alertR[notifyType], g = alertG[notifyType], b = alertB[notifyType];
+  switch (alertStyle[notifyType]) {
+    case 0: animBreathe(r, g, b); break;
+    case 1: animSweep(r, g, b); break;
+    case 2: animBlink(r, g, b); break;
+    case 3: animPulse(r, g, b); break;
+    default: animBreathe(r, g, b); break;
+  }
 }
 
 // --- Mode functions ---
@@ -341,6 +372,26 @@ void modeClock() {
   modeScrollText();
 }
 
+void modeCpuTemp() {
+  if (millis() - lastTempRead > 2000 || lastTempRead == 0) {
+    lastTempRead = millis();
+    cpuTemp = temperatureRead();
+    char buf[8];
+    int t = (int)(cpuTemp + 0.5);
+    sprintf(buf, "%dC", t);
+    if (strcmp(scrollText, buf) != 0) {
+      strcpy(scrollText, buf);
+      scrollPos = -MATRIX_W;
+    }
+    // Color-code by temperature
+    if (cpuTemp < 45) { textR = 0; textG = 100; textB = 255; }        // blue (cool)
+    else if (cpuTemp < 60) { textR = 0; textG = 220; textB = 80; }    // green (normal)
+    else if (cpuTemp < 75) { textR = 255; textG = 200; textB = 0; }   // yellow (warm)
+    else { textR = 255; textG = 0; textB = 0; }                        // red (hot)
+  }
+  modeScrollText();
+}
+
 // --- Web Handlers ---
 void handleColor() {
   String hex = server.arg("hex");
@@ -390,12 +441,52 @@ void handleNotify() {
     server.send(200, "text/plain", "ok");
     return;
   }
-  notifyActive = true;
-  notifyStart = millis();
   if (type == "input") notifyType = 0;
   else if (type == "done") notifyType = 1;
   else if (type == "error") notifyType = 2;
-  else { notifyActive = false; }
+  else { server.send(400, "text/plain", "bad type"); return; }
+
+  // Optional per-call overrides
+  String color = server.arg("color");
+  if (color.length() == 6) {
+    alertR[notifyType] = strtol(color.substring(0, 2).c_str(), NULL, 16);
+    alertG[notifyType] = strtol(color.substring(2, 4).c_str(), NULL, 16);
+    alertB[notifyType] = strtol(color.substring(4, 6).c_str(), NULL, 16);
+  }
+  String style = server.arg("style");
+  if (style == "breathe") alertStyle[notifyType] = 0;
+  else if (style == "sweep") alertStyle[notifyType] = 1;
+  else if (style == "blink") alertStyle[notifyType] = 2;
+  else if (style == "pulse") alertStyle[notifyType] = 3;
+
+  String dur = server.arg("duration");
+  if (dur.length() > 0) notifyDuration = constrain(dur.toInt(), 1000, 30000);
+
+  notifyActive = true;
+  notifyStart = millis();
+  server.send(200, "text/plain", "ok");
+}
+
+void handleAlertConfig() {
+  String type = server.arg("type");
+  int idx = -1;
+  if (type == "input") idx = 0;
+  else if (type == "done") idx = 1;
+  else if (type == "error") idx = 2;
+  if (idx < 0) { server.send(400, "text/plain", "bad type"); return; }
+
+  String color = server.arg("color");
+  if (color.length() == 6) {
+    alertR[idx] = strtol(color.substring(0, 2).c_str(), NULL, 16);
+    alertG[idx] = strtol(color.substring(2, 4).c_str(), NULL, 16);
+    alertB[idx] = strtol(color.substring(4, 6).c_str(), NULL, 16);
+  }
+  String style = server.arg("style");
+  if (style == "breathe") alertStyle[idx] = 0;
+  else if (style == "sweep") alertStyle[idx] = 1;
+  else if (style == "blink") alertStyle[idx] = 2;
+  else if (style == "pulse") alertStyle[idx] = 3;
+
   server.send(200, "text/plain", "ok");
 }
 
@@ -474,12 +565,19 @@ void handleSpeed() {
 }
 
 void handleStatus() {
-  const char* modeNames[] = {"Solid","Rainbow","Breathe","Wave","Matrix Rain","Bitmap","Text","Game of Life","Clock"};
-  String modeName = (mode <= 8) ? modeNames[mode] : "Unknown";
+  const char* modeNames[] = {"Solid","Rainbow","Breathe","Wave","Matrix Rain","Bitmap","Text","Game of Life","Clock","CPU Temp"};
+  String modeName = (mode <= 9) ? modeNames[mode] : "Unknown";
   String json = "{\"mode\":" + String(mode) + ",\"modeName\":\"" + modeName + "\",\"on\":" + String(ledsOn ? "true" : "false") +
     ",\"alerts\":" + String(alertsEnabled ? "true" : "false") +
     ",\"rotation\":" + String(rotation) +
-    ",\"speed\":" + String(animSpeed) + "}";
+    ",\"speed\":" + String(animSpeed) +
+    ",\"cpuTemp\":" + String(cpuTemp, 1) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleCpuTemp() {
+  cpuTemp = temperatureRead();
+  String json = "{\"temp\":" + String(cpuTemp, 1) + "}";
   server.send(200, "application/json", json);
 }
 
@@ -558,6 +656,7 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 <div class="btn" id="m4" onclick="sm(4)">Matrix</div>
 <div class="btn" id="m7" onclick="sm(7)">Life</div>
 <div class="btn" id="m8" onclick="sm(8)">Clock</div>
+<div class="btn" id="m9" onclick="sm(9)">Temp</div>
 </div>
 
 <h2>Pixel Art</h2>
@@ -626,12 +725,45 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 <span>Claude Alerts</span>
 <label class="sw"><input type="checkbox" id="alertTog" checked onchange="send('/alerts?v='+(this.checked?'1':'0'))"><span class="sl"></span></label>
 </div>
-<div class="toggle-row" style="margin-bottom:14px">
+<div class="toggle-row">
 <span>Test Alert</span>
 <div>
 <button class="btn" style="padding:6px 10px;font-size:.75em" onclick="send('/notify?type=input')">Input</button>
 <button class="btn" style="padding:6px 10px;font-size:.75em" onclick="send('/notify?type=done')">Done</button>
 <button class="btn" style="padding:6px 10px;font-size:.75em" onclick="send('/notify?type=error')">Error</button>
+</div>
+</div>
+<div class="toggle-row" onclick="document.getElementById('alertCfg').style.display=document.getElementById('alertCfg').style.display=='none'?'block':'none'" style="cursor:pointer">
+<span>Alert Settings</span><span style="color:#555;font-size:.75em">tap to expand</span>
+</div>
+<div id="alertCfg" style="display:none;background:#1a1a1a;border-radius:10px;padding:12px;margin-bottom:8px">
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+<span style="width:50px;font-size:.8em">Input</span>
+<input type="color" id="acI" value="#ff8c00" style="width:36px;height:28px;border:none;border-radius:4px;cursor:pointer">
+<select id="asI" style="flex:1;padding:6px;border-radius:6px;border:1px solid #333;background:#222;color:#fff;font-size:.8em">
+<option value="breathe" selected>Breathe</option><option value="sweep">Sweep</option><option value="blink">Blink</option><option value="pulse">Pulse</option>
+</select>
+<button class="btn" style="padding:4px 8px;font-size:.7em" onclick="saveAlert('input','acI','asI')">Set</button>
+</div>
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+<span style="width:50px;font-size:.8em">Done</span>
+<input type="color" id="acD" value="#00c800" style="width:36px;height:28px;border:none;border-radius:4px;cursor:pointer">
+<select id="asD" style="flex:1;padding:6px;border-radius:6px;border:1px solid #333;background:#222;color:#fff;font-size:.8em">
+<option value="breathe">Breathe</option><option value="sweep" selected>Sweep</option><option value="blink">Blink</option><option value="pulse">Pulse</option>
+</select>
+<button class="btn" style="padding:4px 8px;font-size:.7em" onclick="saveAlert('done','acD','asD')">Set</button>
+</div>
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+<span style="width:50px;font-size:.8em">Error</span>
+<input type="color" id="acE" value="#ff0000" style="width:36px;height:28px;border:none;border-radius:4px;cursor:pointer">
+<select id="asE" style="flex:1;padding:6px;border-radius:6px;border:1px solid #333;background:#222;color:#fff;font-size:.8em">
+<option value="breathe">Breathe</option><option value="sweep">Sweep</option><option value="blink" selected>Blink</option><option value="pulse">Pulse</option>
+</select>
+<button class="btn" style="padding:4px 8px;font-size:.7em" onclick="saveAlert('error','acE','asE')">Set</button>
+</div>
+<div class="slider-group" style="margin-bottom:0">
+<label style="font-size:.75em">Duration: <span id="durV">5</span>s</label>
+<input type="range" id="durS" min="1" max="30" value="5" oninput="document.getElementById('durV').textContent=this.value">
 </div>
 </div>
 
@@ -641,8 +773,8 @@ input[type=range]{width:100%;accent-color:#0af;height:28px}
 <script>
 let isOn=true;
 const cp=document.getElementById('cp');
-const modeIds=[0,1,2,3,4,7,8];
-const modeNames={0:'Solid',1:'Rainbow',2:'Breathe',3:'Wave',4:'Matrix Rain',5:'Bitmap',6:'Text',7:'Game of Life',8:'Clock'};
+const modeIds=[0,1,2,3,4,7,8,9];
+const modeNames={0:'Solid',1:'Rainbow',2:'Breathe',3:'Wave',4:'Matrix Rain',5:'Bitmap',6:'Text',7:'Game of Life',8:'Clock',9:'CPU Temp'};
 
 cp.addEventListener('input',function(){sc(this.value.substring(1))});
 
@@ -675,6 +807,14 @@ function sendText(){
   let spd=document.getElementById('textSpd').value;
   send('/text?msg='+msg+'&color='+clr+'&speed='+spd);
   showMode(6);
+}
+
+function saveAlert(type,cid,sid){
+  let clr=document.getElementById(cid).value.substring(1);
+  let sty=document.getElementById(sid).value;
+  let dur=document.getElementById('durS').value;
+  send('/alert-config?type='+type+'&color='+clr+'&style='+sty);
+  send('/notify?type='+type+'&duration='+dur+'000');
 }
 
 function send(path){
@@ -792,9 +932,11 @@ void setup() {
   server.on("/upload-bitmap", HTTP_POST, handleUploadBitmap);
   server.on("/text", handleText);
   server.on("/alerts", handleAlerts);
+  server.on("/alert-config", handleAlertConfig);
   server.on("/rotation", handleRotation);
   server.on("/speed", handleSpeed);
   server.on("/status", handleStatus);
+  server.on("/cpu-temp", handleCpuTemp);
   server.begin();
 
   // Init matrix rain speeds
@@ -814,16 +956,12 @@ void loop() {
     delay(300);
   }
 
-  // Notification overlay (5 second duration)
+  // Notification overlay
   if (notifyActive) {
-    if (millis() - notifyStart > 5000) {
+    if (millis() - notifyStart > notifyDuration) {
       notifyActive = false;
     } else {
-      switch (notifyType) {
-        case 0: notifyInputAnim(); break;
-        case 1: notifyDoneAnim(); break;
-        case 2: notifyErrorAnim(); break;
-      }
+      runNotifyAnim();
       return;
     }
   }
@@ -840,5 +978,6 @@ void loop() {
     case 6: modeScrollText(); break;
     case 7: modeGameOfLife(); break;
     case 8: modeClock(); break;
+    case 9: modeCpuTemp(); break;
   }
 }
