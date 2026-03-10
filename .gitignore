@@ -1,0 +1,5 @@
+credentials.h
+.venv/
+build/
+*.bin
+.DS_Store
